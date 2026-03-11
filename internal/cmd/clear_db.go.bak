@@ -1,0 +1,19 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"github.com/gogf/gf/v2/frame/g"
+)
+
+func main() {
+	ctx := context.Background()
+	result, err := g.DB().Exec(ctx, "DELETE FROM messages")
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	fmt.Printf("Successfully deleted %d messages\n", rowsAffected)
+}

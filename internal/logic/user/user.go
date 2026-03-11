@@ -1,0 +1,375 @@
+package user
+
+import (
+	"chatBox/api/v1"
+	"chatBox/internal/logic/jwt"
+	"context"
+	"crypto/rand"
+	"fmt"
+	"math/big"
+	"strings"
+	"time"
+
+	"github.com/gogf/gf/v2/errors/gcode"
+	"github.com/gogf/gf/v2/errors/gerror"
+	"github.com/gogf/gf/v2/frame/g"
+	"github.com/gogf/gf/v2/os/gtime"
+	"github.com/gogf/gf/v2/util/gconv"
+	"golang.org/x/crypto/bcrypt"
+)
+
+type IUserLogic interface {
+	Register(ctx context.Context, in *v1.RegisterReq) (*v1.RegisterRes, error)
+	Login(ctx context.Context, in *v1.LoginReq) (*v1.LoginRes, error)
+	GenerateInvite(ctx context.Context, userId uint64) (*v1.GenerateInviteRes, error)
+	BindCouple(ctx context.Context, userId uint64, inviteCode string) (*v1.BindCoupleRes, error)
+	GetProfile(ctx context.Context, userId uint64) (*v1.GetProfileRes, error)
+	UpdateProfile(ctx context.Context, userId uint64, in *v1.UpdateProfileReq) (*v1.UpdateProfileRes, error)
+	GetCoupleInfo(ctx context.Context, userId uint64) (*v1.GetCoupleInfoRes, error)
+	GetUserIdByPhone(ctx context.Context, phone string) (uint64, error)
+}
+
+type userLogicImpl struct{}
+
+func User() IUserLogic {
+	return &userLogicImpl{}
+}
+
+// Register 用户注册
+func (s *userLogicImpl) Register(ctx context.Context, in *v1.RegisterReq) (*v1.RegisterRes, error) {
+	db := g.DB()
+
+	// 清理手机号：移除 +86 前缀和空格
+	phone := in.Phone
+	phone = strings.TrimPrefix(phone, "+86")
+	phone = strings.ReplaceAll(phone, " ", "")
+	in.Phone = phone
+
+	// 检查手机号是否已存在
+	count, err := db.Model("users").Ctx(ctx).Where("phone", in.Phone).Count()
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "该手机号已注册")
+	}
+
+	// 密码加密
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+
+	// 插入用户
+	now := gtime.Now()
+	result, err := db.Model("users").Ctx(ctx).Data(g.Map{
+		"phone":         in.Phone,
+		"nickname":      in.Nickname,
+		"password_hash": string(hash),
+		"created_at":    now,
+		"updated_at":    now,
+	}).InsertAndGetId()
+
+	if err != nil {
+		return nil, err
+	}
+
+	userId := gconv.Uint64(result)
+
+	// 生成token
+	token, err := jwt.GenerateToken(userId, in.Phone)
+	if err != nil {
+		return nil, err
+	}
+
+	return &v1.RegisterRes{
+		UserId:   userId,
+		Token:    token,
+		Nickname: in.Nickname,
+	}, nil
+}
+
+// Login 用户登录
+func (s *userLogicImpl) Login(ctx context.Context, in *v1.LoginReq) (*v1.LoginRes, error) {
+	db := g.DB()
+
+	// 清理手机号：移除 +86 前缀和空格
+	phone := in.Phone
+	phone = strings.TrimPrefix(phone, "+86")
+	phone = strings.ReplaceAll(phone, " ", "")
+	in.Phone = phone
+
+	// 查询用户
+	user, err := db.Model("users").Ctx(ctx).Where("phone", in.Phone).One()
+	if err != nil {
+		return nil, err
+	}
+	if user.IsEmpty() {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "手机号或密码错误")
+	}
+
+	// 验证密码
+	err = bcrypt.CompareHashAndPassword([]byte(user["password_hash"].String()), []byte(in.Password))
+	if err != nil {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "手机号或密码错误")
+	}
+
+	userId := user["id"].Uint64()
+
+	// 生成token
+	token, err := jwt.GenerateToken(userId, in.Phone)
+	if err != nil {
+		return nil, err
+	}
+
+	return &v1.LoginRes{
+		UserId:   userId,
+		Token:    token,
+		Nickname: user["nickname"].String(),
+		Avatar:   user["avatar"].String(),
+	}, nil
+}
+
+// GenerateInvite 生成邀请码
+func (s *userLogicImpl) GenerateInvite(ctx context.Context, userId uint64) (*v1.GenerateInviteRes, error) {
+	db := g.DB()
+
+	// 检查用户是否已有情侣关系
+	count, err := db.Model("couples").Ctx(ctx).
+		Where("user1_id", userId).
+		WhereOr("user2_id", userId).
+		Where("status", 1).
+		Count()
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "您已有情侣关系")
+	}
+
+	// 生成6位随机数字邀请码
+	inviteCode, err := s.generateInviteCode(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// 暂存到Redis，24小时有效
+	redis := g.Redis()
+	key := fmt.Sprintf("invite:%s:%d", inviteCode, userId)
+	_, err = redis.Set(ctx, key, userId)
+	if err != nil {
+		return nil, err
+	}
+	// 设置过期时间
+	_, err = redis.Expire(ctx, key, int64((time.Hour * 24).Seconds()))
+	if err != nil {
+		return nil, err
+	}
+
+	return &v1.GenerateInviteRes{
+		InviteCode: inviteCode,
+	}, nil
+}
+
+// BindCouple 绑定情侣关系
+func (s *userLogicImpl) BindCouple(ctx context.Context, userId uint64, inviteCode string) (*v1.BindCoupleRes, error) {
+	db := g.DB()
+	redis := g.Redis()
+
+	// 检查用户是否已有情侣关系
+	count, err := db.Model("couples").Ctx(ctx).
+		Where("user1_id", userId).
+		WhereOr("user2_id", userId).
+		Where("status", 1).
+		Count()
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "您已有情侣关系")
+	}
+
+	// 从Redis获取邀请码对应的用户ID
+	keys, err := redis.Keys(ctx, "invite:"+inviteCode+":*")
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "邀请码无效或已过期")
+	}
+
+	// 获取邀请者的用户ID
+	var inviterId uint64
+	for _, key := range keys {
+		val, err := redis.Get(ctx, key)
+		if err != nil {
+			continue
+		}
+		inviterId = gconv.Uint64(val)
+		break
+	}
+
+	if inviterId == 0 || inviterId == userId {
+		return nil, gerror.NewCode(gcode.CodeValidationFailed, "邀请码无效")
+	}
+
+	// 创建情侣关系（确保user1_id < user2_id以避免重复）
+	var user1Id, user2Id uint64
+	if inviterId < userId {
+		user1Id, user2Id = inviterId, userId
+	} else {
+		user1Id, user2Id = userId, inviterId
+	}
+
+	now := gtime.Now()
+	result, err := db.Model("couples").Ctx(ctx).Data(g.Map{
+		"user1_id":    user1Id,
+		"user2_id":    user2Id,
+		"invite_code": inviteCode,
+		"status":      1,
+		"created_at":  now,
+		"updated_at":  now,
+	}).InsertAndGetId()
+
+	if err != nil {
+		return nil, err
+	}
+
+	// 删除邀请码缓存
+	for _, key := range keys {
+		redis.Del(ctx, key)
+	}
+
+	return &v1.BindCoupleRes{
+		CoupleId:  gconv.Uint64(result),
+		PartnerId: inviterId,
+	}, nil
+}
+
+// GetProfile 获取个人信息
+func (s *userLogicImpl) GetProfile(ctx context.Context, userId uint64) (*v1.GetProfileRes, error) {
+	db := g.DB()
+
+	user, err := db.Model("users").Ctx(ctx).Where("id", userId).One()
+	if err != nil {
+		return nil, err
+	}
+	if user.IsEmpty() {
+		return nil, gerror.NewCode(gcode.CodeNotFound, "用户不存在")
+	}
+
+	return &v1.GetProfileRes{
+		UserId:    user["id"].Uint64(),
+		Phone:     user["phone"].String(),
+		Nickname:  user["nickname"].String(),
+		Avatar:    user["avatar"].String(),
+		CreatedAt: user["created_at"].Time(),
+	}, nil
+}
+
+// UpdateProfile 更新个人信息
+func (s *userLogicImpl) UpdateProfile(ctx context.Context, userId uint64, in *v1.UpdateProfileReq) (*v1.UpdateProfileRes, error) {
+	db := g.DB()
+
+	_, err := db.Model("users").Ctx(ctx).Where("id", userId).Update(g.Map{
+		"nickname":   in.Nickname,
+		"avatar":     in.Avatar,
+		"updated_at": gtime.Now(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &v1.UpdateProfileRes{
+		UserId: userId,
+	}, nil
+}
+
+// GetCoupleInfo 获取情侣信息
+func (s *userLogicImpl) GetCoupleInfo(ctx context.Context, userId uint64) (*v1.GetCoupleInfoRes, error) {
+	db := g.DB()
+
+	// 查询情侣关系
+	couple, err := db.Model("couples").Ctx(ctx).
+		Where("user1_id", userId).
+		WhereOr("user2_id", userId).
+		Where("status", 1).One()
+	if err != nil {
+		return nil, err
+	}
+	if couple.IsEmpty() {
+		return nil, nil // 未绑定情侣
+	}
+
+	coupleId := couple["id"].Uint64()
+	user1Id := couple["user1_id"].Uint64()
+	user2Id := couple["user2_id"].Uint64()
+
+	var partnerId uint64
+	if userId == user1Id {
+		partnerId = user2Id
+	} else {
+		partnerId = user1Id
+	}
+
+	// 获取伴侣信息
+	partner, err := db.Model("users").Ctx(ctx).Where("id", partnerId).One()
+	if err != nil {
+		return nil, err
+	}
+
+	return &v1.GetCoupleInfoRes{
+		CoupleId:  coupleId,
+		UserId:    userId,
+		PartnerId: partnerId,
+		Nickname:  partner["nickname"].String(),
+		Avatar:    partner["avatar"].String(),
+	}, nil
+}
+
+// GetUserIdByPhone 根据手机号获取用户ID
+func (s *userLogicImpl) GetUserIdByPhone(ctx context.Context, phone string) (uint64, error) {
+	db := g.DB()
+
+	user, err := db.Model("users").Ctx(ctx).Where("phone", phone).One()
+	if err != nil {
+		return 0, err
+	}
+	if user.IsEmpty() {
+		return 0, nil
+	}
+	return user["id"].Uint64(), nil
+}
+
+// generateInviteCode 生成6位随机数字邀请码
+func (s *userLogicImpl) generateInviteCode(ctx context.Context) (string, error) {
+	const maxAttempts = 10
+	db := g.DB()
+
+	for i := 0; i < maxAttempts; i++ {
+		code := ""
+		for j := 0; j < 6; j++ {
+			n, _ := rand.Int(rand.Reader, big.NewInt(10))
+			code += n.String()
+		}
+
+		// 检查邀请码是否已存在
+		count, err := db.Model("couples").Ctx(ctx).Where("invite_code", code).Count()
+		if err != nil {
+			continue
+		}
+
+		// 检查Redis中是否已存在
+		redis := g.Redis()
+		keys, err := redis.Keys(ctx, "invite:"+code+":*")
+		if err != nil {
+			continue
+		}
+
+		if count == 0 && len(keys) == 0 {
+			return code, nil
+		}
+	}
+
+	return "", gerror.New("生成邀请码失败，请重试")
+}
